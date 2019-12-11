@@ -23,7 +23,6 @@ from karbor.services.protection import protection_plugin
 from karbor.services.protection.protection_plugins import utils
 from karbor.services.protection.protection_plugins.volume \
     import volume_glance_plugin_schemas as volume_schemas
-import time 
 LOG = logging.getLogger(__name__)
 
 volume_glance_opts = [
