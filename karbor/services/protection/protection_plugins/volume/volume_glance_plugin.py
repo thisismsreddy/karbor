@@ -23,7 +23,7 @@ from karbor.services.protection import protection_plugin
 from karbor.services.protection.protection_plugins import utils
 from karbor.services.protection.protection_plugins.volume \
     import volume_glance_plugin_schemas as volume_schemas
-
+import time 
 LOG = logging.getLogger(__name__)
 
 volume_glance_opts = [
@@ -283,13 +283,16 @@ class ProtectOperation(protection_plugin.Operation):
                          'temporary_image_id': temporary_image_id
                      })
         finally:
-            if snapshot_id:
+            if temporary_image_id:
                 try:
-                    cinder_client.volume_snapshots.delete(snapshot_id)
+                    glance_client.images.delete(temporary_image_id)
                 except Exception as e:
-                    LOG.warning('Failed deleting snapshot: %(snapshot_id)s. '
-                                'Reason: %(reason)s',
-                                {'snapshot_id': self.snapshot_id, 'reason': e})
+                    LOG.warning('Failed deleting temporary image: '
+                                '%(temporary_image_id)s. '
+                                'Reason: %(reason)s', {
+                                    'temporary_image_id': temporary_image_id,
+                                    'reason': e
+                                })
 
             if temporary_volume:
                 try:
@@ -301,15 +304,15 @@ class ProtectOperation(protection_plugin.Operation):
                                     'temporary_volume_id': temporary_volume.id,
                                     'reason': e
                                 })
-            if temporary_image_id:
+            if snapshot_id:
                 try:
-                    glance_client.images.delete(temporary_image_id)
+                    cinder_client.volume_snapshots.delete(snapshot_id)
                 except Exception as e:
-                    LOG.warning('Failed deleting temporary image: '
-                                '%(temporary_image_id)s. '
+                    LOG.warning('Failed deleting snapshot: %(snapshot_id)s. '
                                 'Reason: %(reason)s', {
-                                    'temporary_image_id': temporary_image_id,
-                                    'reason': e})
+                                    'snapshot_id': self.snapshot_id,
+                                    'reason': e
+                                })
 
 
 class RestoreOperation(protection_plugin.Operation):
@@ -317,32 +320,24 @@ class RestoreOperation(protection_plugin.Operation):
         super(RestoreOperation, self).__init__()
         self._interval = poll_interval
 
+    def _check_create_complete(self, cinder_client, volume_id):
+        return utils.status_poll(
+            partial(get_volume_status, cinder_client, volume_id),
+            interval=self._interval,
+            success_statuses=VOLUME_SUCCESS_STATUSES,
+            failure_statuses=VOLUME_FAILURE_STATUSES,
+            ignore_statuses=VOLUME_IGNORE_STATUSES
+        )
+
     def _create_volume_from_image(self, cinder_client, temporary_image,
-                                  restore_name, original_vol_id, volume_size,
-                                  description):
+                                  restore_name, volume_size, description):
         volume = cinder_client.volumes.create(
             size=volume_size,
             imageRef=temporary_image.id,
             name=restore_name,
             description=description
         )
-        is_success = utils.status_poll(
-            partial(get_volume_status, cinder_client, volume.id),
-            interval=self._interval,
-            success_statuses=VOLUME_SUCCESS_STATUSES,
-            failure_statuses=VOLUME_FAILURE_STATUSES,
-            ignore_statuses=VOLUME_IGNORE_STATUSES
-        )
-        if not is_success:
-            LOG.error("Restore volume glance backup failed, so delete "
-                      "the temporary volume: volume_id: %s.", original_vol_id)
-            cinder_client.volumes.delete(volume.id)
-            raise exception.CreateResourceFailed(
-                name="Volume Glance Backup",
-                reason='Restored Volume is in erroneous state',
-                resource_id=volume.id,
-                resource_type=constants.VOLUME_RESOURCE_TYPE,
-            )
+        return volume.id
 
     def on_main(self, checkpoint, resource, context, parameters, **kwargs):
         original_volume_id = resource.id
@@ -360,9 +355,34 @@ class RestoreOperation(protection_plugin.Operation):
             temporary_image = self._create_temporary_image(
                 bank_section, glance_client, original_volume_id
             )
-            self._create_volume_from_image(cinder_client, temporary_image,
-                                           restore_name, original_volume_id,
-                                           volume_size, restore_description)
+            volume_id = self._create_volume_from_image(
+                cinder_client, temporary_image, restore_name, volume_size,
+                restore_description
+            )
+
+            # check and update
+            update_method = partial(
+                utils.update_resource_restore_result,
+                kwargs.get('restore'), resource.type, volume_id
+            )
+
+            update_method(constants.RESOURCE_STATUS_RESTORING)
+
+            is_success = self._check_create_complete(cinder_client, volume_id)
+            if is_success:
+                update_method(constants.RESOURCE_STATUS_AVAILABLE)
+                kwargs.get("new_resources")[original_volume_id] = volume_id
+            else:
+                LOG.error("Restore volume glance backup failed, so delete "
+                          "the temporary volume: volume_id: %s.",
+                          original_volume_id)
+                cinder_client.volumes.delete(volume_id)
+                raise exception.CreateResourceFailed(
+                    name="Volume Glance Backup",
+                    reason='Restored Volume is in erroneous state',
+                    resource_id=volume_id,
+                    resource_type=constants.VOLUME_RESOURCE_TYPE,
+                )
         finally:
             if temporary_image:
                 try:
